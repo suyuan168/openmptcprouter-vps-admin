@@ -701,7 +701,7 @@ async def config(current_user: User = Depends(get_current_user)):
         else:
             glorytun_udp_host_ip = '10.255.254.1'
             glorytun_udp_client_ip = '10.255.254.2'
-    available_vpn = ["glorytun-tcp", "glorytun-udp"]
+    available_vpn = ["glorytun_tcp", "glorytun_udp"]
     LOG.debug('Get config... dsvpn')
     if os.path.isfile('/etc/dsvpn/dsvpn' + str(userid) + '.key'):
         dsvpn_key = open('/etc/dsvpn/dsvpn' + str(userid) + '.key').readline().rstrip()
@@ -1044,12 +1044,12 @@ def shorewall_list(*, params: ShorewallListparams, current_user: User = Depends(
     if params.ipproto == 'ipv4':
         with open('/etc/shorewall/rules', 'r') as f:
             for line in f:
-                if '# OMR ' + name in line:
+                if '# OMR ' + current_user.username + ' ' + name in line:
                     fwlist.append(line)
     else:
         with open('/etc/shorewall6/rules', 'r') as f:
             for line in f:
-                if '# OMR ' + name in line:
+                if '# OMR ' + current_user.username + ' ' + name in line:
                     fwlist.append(line)
     return {'list': fwlist}
 
@@ -1439,6 +1439,7 @@ class VPN(str, Enum):
     openvpn = "openvpn"
     glorytuntcp = "glorytun_tcp"
     glorytunudp = "glorytun_udp"
+    dsvpn = "dsvpn"
 
 class permissions(str, Enum):
     ro = "ro"
