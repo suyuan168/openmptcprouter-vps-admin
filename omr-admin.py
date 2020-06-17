@@ -63,6 +63,16 @@ IFACE = None
 for line in READ.splitlines():
     if 'NET_IFACE=' in line:
         IFACE = line.split('=', 1)[1]
+FILE.close()
+
+# Get ipv6 net interface
+FILE = open('/etc/shorewall6/params.net', "r")
+READ = FILE.read()
+IFACE6 = None
+for line in READ.splitlines():
+    if 'NET_IFACE=' in line:
+        IFACE6 = line.split('=', 1)[1]
+FILE.close()
 
 # Get interface rx/tx
 def get_bytes(t, iface='eth0'):
@@ -71,10 +81,17 @@ def get_bytes(t, iface='eth0'):
     return int(data)
 
 def get_bytes_ss(port):
-    ss_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    ss_socket.settimeout(3)
-    ss_socket.sendto('ping'.encode(), ("127.0.0.1", 8839))
-    ss_recv = ss_socket.recv(1024)
+    try:
+        ss_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        ss_socket.settimeout(3)
+        ss_socket.sendto('ping'.encode(), ("127.0.0.1", 8839))
+        ss_recv = ss_socket.recv(1024)
+    except socket.timeout as err:
+        LOG.debug("Shadowsocks stats timeout (" + err + ")")
+        return 0
+    except socket.error as err:
+        LOG.debug("Shadowsocks stats error (" + err + ")")
+        return 0
     json_txt = ss_recv.decode("utf-8").replace('stat: ', '')
     result = json.loads(json_txt)
     if str(port) in result:
@@ -215,7 +232,7 @@ def file_as_bytes(file):
     with file:
         return file.read()
 
-def shorewall_add_port(user, port, proto, name, fwtype='ACCEPT'):
+def shorewall_add_port(user, port, proto, name, fwtype='ACCEPT', source_dip = ''):
     userid = user.userid
     if userid is None:
         userid = 0
@@ -224,38 +241,58 @@ def shorewall_add_port(user, port, proto, name, fwtype='ACCEPT'):
     with open('/etc/shorewall/rules', 'r') as f, \
           open(tmpfile, 'a+') as n:
         for line in f:
-            if (fwtype == 'ACCEPT' and not port + '	# OMR open ' + name + ' port ' + proto in line and not port + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto in line):
-                n.write(line)
-            elif fwtype == 'DNAT' and not port + '	# OMR redirect ' + name + ' port ' + proto in line and not port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto in line:
-                n.write(line)
-        if fwtype == 'ACCEPT':
-            n.write('ACCEPT		net		$FW		' + proto + '	' + port + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto + "\n")
-        elif fwtype == 'DNAT' and userid == 0:
-            n.write('DNAT		net		vpn:$OMR_ADDR	' + proto + '	' + port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + "\n")
-        elif fwtype == 'DNAT' and userid != 0:
-            n.write('DNAT		net		vpn:$OMR_ADDR_USER' + str(userid) + '	' + proto + '	' + port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + "\n")
+            if source_dip == '':
+                if (fwtype == 'ACCEPT' and not port + '	# OMR open ' + name + ' port ' + proto in line and not port + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto in line):
+                    n.write(line)
+                elif fwtype == 'DNAT' and not port + '	# OMR redirect ' + name + ' port ' + proto in line and not port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto in line:
+                    n.write(line)
+            else:
+                if (fwtype == 'ACCEPT' and not '# OMR ' + user.username + ' open ' + name + ' port ' + proto + ' from ' + source_dip in line):
+                    n.write(line)
+                elif fwtype == 'DNAT' and not '# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + ' from ' + source_dip in line:
+                    n.write(line)
+        if source_dip == '':
+            if fwtype == 'ACCEPT':
+                n.write('ACCEPT		net		$FW		' + proto + '	' + port + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto + "\n")
+            elif fwtype == 'DNAT' and userid == 0:
+                n.write('DNAT		net		vpn:$OMR_ADDR	' + proto + '	' + port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + "\n")
+            elif fwtype == 'DNAT' and userid != 0:
+                n.write('DNAT		net		vpn:$OMR_ADDR_USER' + str(userid) + '	' + proto + '	' + port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + "\n")
+        else:
+            if fwtype == 'ACCEPT':
+                n.write('ACCEPT		net		$FW		' + proto + '	' + port + '	-	' + source_dip + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto + ' from ' + source_dip + "\n")
+            elif fwtype == 'DNAT' and userid == 0:
+                n.write('DNAT		net		vpn:$OMR_ADDR	' + proto + '	' + port + '	-	' + source_dip + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + ' from ' + source_dip + "\n")
+            elif fwtype == 'DNAT' and userid != 0:
+                n.write('DNAT		net		vpn:$OMR_ADDR_USER' + str(userid) + '	' + proto + '	' + port + '	-	' + source_dip + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + ' from ' + source_dip + "\n")
     os.close(fd)
     move(tmpfile, '/etc/shorewall/rules')
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/rules', 'rb'))).hexdigest()
     if initial_md5 != final_md5:
         os.system("systemctl -q reload shorewall")
 
-def shorewall_del_port(username, port, proto, name, fwtype='ACCEPT'):
+def shorewall_del_port(username, port, proto, name, fwtype='ACCEPT', source_dip=''):
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/rules', 'rb'))).hexdigest()
     fd, tmpfile = mkstemp()
     with open('/etc/shorewall/rules', 'r') as f, open(tmpfile, 'a+') as n:
         for line in f:
-            if fwtype == 'ACCEPT' and not port + '	# OMR open ' + name + ' port ' + proto in line and not port + '	# OMR ' + username + ' open ' + name + ' port ' + proto in line:
-                n.write(line)
-            elif fwtype == 'DNAT' and not port + '	# OMR redirect ' + name + ' port ' + proto in line and not port + '	# OMR ' + username + ' redirect ' + name + ' port ' + proto in line:
-                n.write(line)
+            if source_dip == '':
+                if fwtype == 'ACCEPT' and not port + '	# OMR open ' + name + ' port ' + proto in line and not port + '	# OMR ' + username + ' open ' + name + ' port ' + proto in line:
+                    n.write(line)
+                elif fwtype == 'DNAT' and not port + '	# OMR redirect ' + name + ' port ' + proto in line and not port + '	# OMR ' + username + ' redirect ' + name + ' port ' + proto in line:
+                    n.write(line)
+            else:
+                if fwtype == 'ACCEPT' and not port + '# OMR ' + username + ' open ' + name + ' port ' + proto + ' from ' + source_dip in line:
+                    n.write(line)
+                elif fwtype == 'DNAT' and not port + '# OMR ' + username + ' redirect ' + name + ' port ' + proto + ' from ' + source_dip in line:
+                    n.write(line)
     os.close(fd)
     move(tmpfile, '/etc/shorewall/rules')
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall/rules', 'rb'))).hexdigest()
     if initial_md5 != final_md5:
         os.system("systemctl -q reload shorewall")
 
-def shorewall6_add_port(user, port, proto, name, fwtype='ACCEPT'):
+def shorewall6_add_port(user, port, proto, name, fwtype='ACCEPT', source_dip=''):
     userid = user.userid
     if userid is None:
         userid = 0
@@ -263,31 +300,51 @@ def shorewall6_add_port(user, port, proto, name, fwtype='ACCEPT'):
     fd, tmpfile = mkstemp()
     with open('/etc/shorewall6/rules', 'r') as f, open(tmpfile, 'a+') as n:
         for line in f:
-            if fwtype == 'ACCEPT' and not port + '	# OMR open ' + name + ' port ' + proto in line and not port + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto in line:
-                n.write(line)
-            elif fwtype == 'DNAT' and not port + '	# OMR redirect ' + name + ' port ' + proto in line and not port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto in line:
-                n.write(line)
-        if fwtype == 'ACCEPT':
-            n.write('ACCEPT		net		$FW		' + proto + '	' + port + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto + "\n")
-        elif fwtype == 'DNAT' and userid == 0:
-            n.write('DNAT		net		vpn:$OMR_ADDR	' + proto + '	' + port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + "\n")
-        elif fwtype == 'DNAT' and userid != 0:
-            n.write('DNAT		net		vpn:$OMR_ADDR_USER' + str(userid) + '	' + proto + '	' + port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + "\n")
+            if source_dip == '':
+                if fwtype == 'ACCEPT' and not port + '	# OMR open ' + name + ' port ' + proto in line and not port + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto in line:
+                    n.write(line)
+                elif fwtype == 'DNAT' and not port + '	# OMR redirect ' + name + ' port ' + proto in line and not port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto in line:
+                    n.write(line)
+            else:
+                if fwtype == 'ACCEPT' and not port + '# OMR ' + user.username + ' open ' + name + ' port ' + proto + ' from ' + source_dip in line:
+                    n.write(line)
+                elif fwtype == 'DNAT' and not port + '# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + ' from ' + source_dip in line:
+                    n.write(line)
+        if source_dip == '':
+            if fwtype == 'ACCEPT':
+                n.write('ACCEPT		net		$FW		' + proto + '	' + port + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto + "\n")
+            elif fwtype == 'DNAT' and userid == 0:
+                n.write('DNAT		net		vpn:$OMR_ADDR	' + proto + '	' + port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + "\n")
+            elif fwtype == 'DNAT' and userid != 0:
+                n.write('DNAT		net		vpn:$OMR_ADDR_USER' + str(userid) + '	' + proto + '	' + port + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + "\n")
+        else:
+            if fwtype == 'ACCEPT':
+                n.write('ACCEPT		net		$FW		' + proto + '	' + port +  '	-	' + source_dip + '	# OMR ' + user.username + ' open ' + name + ' port ' + proto + ' from ' + source_dip +  "\n")
+            elif fwtype == 'DNAT' and userid == 0:
+                n.write('DNAT		net		vpn:$OMR_ADDR	' + proto + '	' + port +  '	-	' + source_dip + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + ' from ' + source_dip +  "\n")
+            elif fwtype == 'DNAT' and userid != 0:
+                n.write('DNAT		net		vpn:$OMR_ADDR_USER' + str(userid) + '	' + proto + '	' + port +  '	-	' + source_dip + '	# OMR ' + user.username + ' redirect ' + name + ' port ' + proto + ' from ' + source_dip + "\n")
     os.close(fd)
     move(tmpfile, '/etc/shorewall6/rules')
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall6/rules', 'rb'))).hexdigest()
     if initial_md5 != final_md5:
         os.system("systemctl -q reload shorewall6")
 
-def shorewall6_del_port(username, port, proto, name, fwtype='ACCEPT'):
+def shorewall6_del_port(username, port, proto, name, fwtype='ACCEPT', source_dip=''):
     initial_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall6/rules', 'rb'))).hexdigest()
     fd, tmpfile = mkstemp()
     with open('/etc/shorewall6/rules', 'r') as f, open(tmpfile, 'a+') as n:
         for line in f:
-            if fwtype == 'ACCEPT' and not port + '	# OMR open ' + name + ' port ' + proto in line and not port + '	# OMR ' + username + ' open ' + name + ' port ' + proto in line:
-                n.write(line)
-            elif fwtype == 'DNAT' and not port + '	# OMR redirect ' + name + ' port ' + proto in line and not port + '	# OMR ' + username + ' redirect ' + name + ' port ' + proto in line:
-                n.write(line)
+            if source_dip == '':
+                if fwtype == 'ACCEPT' and not port + '	# OMR open ' + name + ' port ' + proto in line and not port + '	# OMR ' + username + ' open ' + name + ' port ' + proto in line:
+                    n.write(line)
+                elif fwtype == 'DNAT' and not port + '	# OMR redirect ' + name + ' port ' + proto in line and not port + '	# OMR ' + username + ' redirect ' + name + ' port ' + proto in line:
+                    n.write(line)
+            else:
+                if fwtype == 'ACCEPT' and not '# OMR ' + username + ' open ' + name + ' port ' + proto + ' from ' + source_dip in line:
+                    n.write(line)
+                elif fwtype == 'DNAT' and not '# OMR ' + username + ' redirect ' + name + ' port ' + proto + ' from ' + source_dip in line:
+                    n.write(line)
     os.close(fd)
     move(tmpfile, '/etc/shorewall6/rules')
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/shorewall6/rules', 'rb'))).hexdigest()
@@ -575,11 +632,11 @@ async def status(current_user: User = Depends(get_current_user)):
     vps_kernel = os.popen('uname -r').read().rstrip()
     vps_omr_version = os.popen("grep -s 'OpenMPTCProuter VPS' /etc/* | awk '{print $4}'").read().rstrip()
     mptcp_enabled = os.popen('sysctl -n net.mptcp.mptcp_enabled').read().rstrip()
-    #shadowsocks_port = current_user.shadowsocks_port
-    #if not shadowsocks_port == None:
-    #    ss_traffic = get_bytes_ss(current_user.shadowsocks_port)
-    #else:
-    ss_traffic = 0
+    shadowsocks_port = current_user.shadowsocks_port
+    if not shadowsocks_port == None:
+        ss_traffic = get_bytes_ss(current_user.shadowsocks_port)
+    else:
+        ss_traffic = 0
 
     LOG.debug('Get status: done')
     if IFACE:
@@ -606,7 +663,7 @@ async def config(current_user: User = Depends(get_current_user)):
     try:
         data = json.loads(content)
     except ValueError as e:
-        data = {'key': '', 'server_port': 65101, 'method': 'chacha20'}
+        data = {'port_key': '', 'server_port': 65101, 'method': 'chacha20'}
     #shadowsocks_port = data["server_port"]
     shadowsocks_port = current_user.shadowsocks_port
     if shadowsocks_port is not None:
@@ -649,10 +706,10 @@ async def config(current_user: User = Depends(get_current_user)):
         shadowsocks_obfs_plugin = ''
         shadowsocks_obfs_type = ''
     shadowsocks_port = current_user.shadowsocks_port
-    #if not shadowsocks_port == None:
-    #    ss_traffic = get_bytes_ss(current_user.shadowsocks_port)
-    #else:
-    ss_traffic = 0
+    if not shadowsocks_port == None:
+        ss_traffic = get_bytes_ss(current_user.shadowsocks_port)
+    else:
+        ss_traffic = 0
 
     LOG.debug('Get config... glorytun')
     if os.path.isfile('/etc/glorytun-tcp/tun' + str(userid) +'.key'):
@@ -811,9 +868,15 @@ async def config(current_user: User = Depends(get_current_user)):
     congestion_control = os.popen('sysctl -n net.ipv4.tcp_congestion_control').read().rstrip()
 
     LOG.debug('Get config... ipv6')
-    ipv6_network = os.popen('ip -6 addr show ' + IFACE +' | grep -oP "(?<=inet6 ).*(?= scope global)"').read().rstrip()
+    if 'ipv6_network' in omr_config_data:
+        ipv6_network = omr_config_data['ipv6_network']
+    else:
+        ipv6_network = os.popen('ip -6 addr show ' + IFACE6 +' | grep -oP "(?<=inet6 ).*(?= scope global)"').read().rstrip()
     #ipv6_addr = os.popen('wget -6 -qO- -T 2 ipv6.openmptcprouter.com').read().rstrip()
-    ipv6_addr = os.popen('ip -6 addr show ' + IFACE +' | grep -oP "(?<=inet6 ).*(?= scope global)" | cut -d/ -f1').read().rstrip()
+    if 'ipv6_addr' in omr_config_data:
+        ipv6_addr = omr_config_data['ipv6_addr']
+    else:
+        ipv6_addr = os.popen('ip -6 addr show ' + IFACE6 +' | grep -oP "(?<=inet6 ).*(?= scope global)" | cut -d/ -f1').read().rstrip()
     #ipv4_addr = os.popen('wget -4 -qO- -T 1 https://ip.openmptcprouter.com').read().rstrip()
     LOG.debug('get server IPv4')
     if 'ipv4' in omr_config_data:
@@ -856,6 +919,7 @@ async def config(current_user: User = Depends(get_current_user)):
 
     localip6 = ''
     remoteip6 = ''
+    ula = ''
     if userid == 0:
         if os.path.isfile('/etc/openmptcprouter-vps-admin/omr-6in4/user' + str(userid)):
             with open('/etc/openmptcprouter-vps-admin/omr-6in4/user' + str(userid), "r") as omr6in4_file:
@@ -864,6 +928,8 @@ async def config(current_user: User = Depends(get_current_user)):
                         localip6 = line.replace(line[:9], '').rstrip()
                     if 'REMOTEIP6=' in line:
                         remoteip6 = line.replace(line[:10], '').rstrip()
+                    if 'ULA=' in line:
+                        ula = line.replace(line[:4], '').rstrip()
     else:
         locaip6 = 'fe80::a00:1'
         remoteip6 = 'fe80::a00:2'
@@ -871,6 +937,21 @@ async def config(current_user: User = Depends(get_current_user)):
     vpn = 'glorytun_tcp'
     if 'vpn' in omr_config_data['users'][0][current_user.username]:
         vpn = omr_config_data['users'][0][current_user.username]['vpn']
+
+    vpn_traffic = 0
+    if vpn == 'glorytun_tcp':
+        vpn_traffic_rx = get_bytes('rx','gt-tun' + str(userid))
+        vpn_traffic_tx = get_bytes('tx','gt-tun' + str(userid))
+    elif vpn == 'glorytun_udp':
+        vpn_traffic_rx = get_bytes('rx','gt-udp-tun' + str(userid))
+        vpn_traffic_tx = get_bytes('tx','gt-udp-tun' + str(userid))
+    elif vpn == 'mlvpn':
+        vpn_traffic_rx = get_bytes('rx','mlvpn' + str(userid))
+        vpn_traffic_tx = get_bytes('tx','mlvpn' + str(userid))
+    elif vpn == 'dsvpn':
+        vpn_traffic_rx = get_bytes('rx','dsvpn' + str(userid))
+        vpn_traffic_tx = get_bytes('tx','dsvpn' + str(userid))
+
     #vpn = current_user.vpn
     if user_permissions == 'ro':
         del available_vpn
@@ -890,7 +971,7 @@ async def config(current_user: User = Depends(get_current_user)):
             if '#DNAT		net		vpn:$OMR_ADDR	tcp	1-64999' in line:
                 shorewall_redirect = "disable"
     LOG.debug('Get config: done')
-    return {'vps': {'kernel': vps_kernel, 'machine': vps_machine, 'omr_version': vps_omr_version, 'loadavg': vps_loadavg, 'uptime': vps_uptime, 'aes': vps_aes}, 'shadowsocks': {'traffic': ss_traffic, 'key': shadowsocks_key, 'port': shadowsocks_port, 'method': shadowsocks_method, 'fast_open': shadowsocks_fast_open, 'reuse_port': shadowsocks_reuse_port, 'no_delay': shadowsocks_no_delay, 'mptcp': shadowsocks_mptcp, 'ebpf': shadowsocks_ebpf, 'obfs': shadowsocks_obfs, 'obfs_plugin': shadowsocks_obfs_plugin, 'obfs_type': shadowsocks_obfs_type}, 'glorytun': {'key': glorytun_key, 'udp': {'host_ip': glorytun_udp_host_ip, 'client_ip': glorytun_udp_client_ip}, 'tcp': {'host_ip': glorytun_tcp_host_ip, 'client_ip': glorytun_tcp_client_ip}, 'port': glorytun_port, 'chacha': glorytun_chacha}, 'dsvpn': {'key': dsvpn_key, 'host_ip': dsvpn_host_ip, 'client_ip': dsvpn_client_ip, 'port': dsvpn_port}, 'openvpn': {'key': openvpn_key, 'client_key': openvpn_client_key, 'client_crt': openvpn_client_crt, 'client_ca': openvpn_client_ca, 'host_ip': openvpn_host_ip, 'client_ip': openvpn_client_ip, 'port': openvpn_port}, 'mlvpn': {'key': mlvpn_key, 'host_ip': mlvpn_host_ip, 'client_ip': mlvpn_client_ip}, 'shorewall': {'redirect_ports': shorewall_redirect}, 'mptcp': {'enabled': mptcp_enabled, 'checksum': mptcp_checksum, 'path_manager': mptcp_path_manager, 'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries}, 'network': {'congestion_control': congestion_control, 'ipv6_network': ipv6_network, 'ipv6': ipv6_addr, 'ipv4': ipv4_addr, 'domain': vps_domain, 'internet': internet}, 'vpn': {'available': available_vpn, 'current': vpn, 'remoteip': vpn_remote_ip, 'localip': vpn_local_ip}, 'iperf': {'user': 'openmptcprouter', 'password': 'openmptcprouter', 'key': iperf3_key}, 'pihole': {'state': pihole}, 'user': {'name': current_user.username, 'permission': user_permissions}, '6in4': {'localip': localip6, 'remoteip': remoteip6}, 'client2client': {'enabled': client2client, 'lanips': alllanips}}
+    return {'vps': {'kernel': vps_kernel, 'machine': vps_machine, 'omr_version': vps_omr_version, 'loadavg': vps_loadavg, 'uptime': vps_uptime, 'aes': vps_aes}, 'shadowsocks': {'traffic': ss_traffic, 'key': shadowsocks_key, 'port': shadowsocks_port, 'method': shadowsocks_method, 'fast_open': shadowsocks_fast_open, 'reuse_port': shadowsocks_reuse_port, 'no_delay': shadowsocks_no_delay, 'mptcp': shadowsocks_mptcp, 'ebpf': shadowsocks_ebpf, 'obfs': shadowsocks_obfs, 'obfs_plugin': shadowsocks_obfs_plugin, 'obfs_type': shadowsocks_obfs_type}, 'glorytun': {'key': glorytun_key, 'udp': {'host_ip': glorytun_udp_host_ip, 'client_ip': glorytun_udp_client_ip}, 'tcp': {'host_ip': glorytun_tcp_host_ip, 'client_ip': glorytun_tcp_client_ip}, 'port': glorytun_port, 'chacha': glorytun_chacha}, 'dsvpn': {'key': dsvpn_key, 'host_ip': dsvpn_host_ip, 'client_ip': dsvpn_client_ip, 'port': dsvpn_port}, 'openvpn': {'key': openvpn_key, 'client_key': openvpn_client_key, 'client_crt': openvpn_client_crt, 'client_ca': openvpn_client_ca, 'host_ip': openvpn_host_ip, 'client_ip': openvpn_client_ip, 'port': openvpn_port}, 'mlvpn': {'key': mlvpn_key, 'host_ip': mlvpn_host_ip, 'client_ip': mlvpn_client_ip}, 'shorewall': {'redirect_ports': shorewall_redirect}, 'mptcp': {'enabled': mptcp_enabled, 'checksum': mptcp_checksum, 'path_manager': mptcp_path_manager, 'scheduler': mptcp_scheduler, 'syn_retries': mptcp_syn_retries}, 'network': {'congestion_control': congestion_control, 'ipv6_network': ipv6_network, 'ipv6': ipv6_addr, 'ipv4': ipv4_addr, 'domain': vps_domain, 'internet': internet}, 'vpn': {'available': available_vpn, 'current': vpn, 'remoteip': vpn_remote_ip, 'localip': vpn_local_ip,'rx': vpn_traffic_rx,'tx': vpn_traffic_tx}, 'iperf': {'user': 'openmptcprouter', 'password': 'openmptcprouter', 'key': iperf3_key}, 'pihole': {'state': pihole}, 'user': {'name': current_user.username, 'permission': user_permissions}, 'ip6in4': {'localip': localip6, 'remoteip': remoteip6,'ula': ula}, 'client2client': {'enabled': client2client, 'lanips': alllanips}}
 
 # Set shadowsocks config
 class ShadowsocksConfigparams(BaseModel):
@@ -910,7 +991,7 @@ def shadowsocks(*, params: ShadowsocksConfigparams, current_user: User = Depends
     if current_user.permissions == "ro":
         set_lastchange(10)
         return {'result': 'permission', 'reason': 'Read only user', 'route': 'shadowsocks'}
-    ipv6_network = os.popen('ip -6 addr show ' + IFACE +' | grep -oP "(?<=inet6 ).*(?= scope global)"').read().rstrip()
+    ipv6_network = os.popen('ip -6 addr show ' + IFACE6 +' | grep -oP "(?<=inet6 ).*(?= scope global)"').read().rstrip()
     with open('/etc/shadowsocks-libev/manager.json') as f:
         content = f.read()
     content = re.sub(",\s*}", "}", content) # pylint: disable=W1401
@@ -1096,6 +1177,7 @@ class Shorewallparams(BaseModel):
     proto: str
     fwtype: str
     ipproto: str = "ipv4"
+    source_dip: str = ""
 
 @app.post('/shorewallopen')
 def shorewall_open(*, params: Shorewallparams, current_user: User = Depends(get_current_user)):
@@ -1105,12 +1187,13 @@ def shorewall_open(*, params: Shorewallparams, current_user: User = Depends(get_
     port = params.port
     proto = params.proto
     fwtype = params.fwtype
+    source_dip = params.source_dip
     if name is None:
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'shorewallopen'}
     if params.ipproto == 'ipv4':
-        shorewall_add_port(current_user, str(port), proto, name, fwtype)
+        shorewall_add_port(current_user, str(port), proto, name, fwtype, source_dip)
     else:
-        shorewall6_add_port(current_user, str(port), proto, name, fwtype)
+        shorewall6_add_port(current_user, str(port), proto, name, fwtype, source_dip)
     return {'result': 'done', 'reason': 'changes applied'}
 
 @app.post('/shorewallclose')
@@ -1121,12 +1204,13 @@ def shorewall_close(*, params: Shorewallparams, current_user: User = Depends(get
     port = params.port
     proto = params.proto
     fwtype = params.fwtype
+    source_dip = params.source_dip
     if name is None:
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'shorewallclose'}
     if params.ipproto == 'ipv4':
-        shorewall_del_port(current_user.username, str(port), proto, name, fwtype)
+        shorewall_del_port(current_user.username, str(port), proto, name, fwtype, source_dip)
     else:
-        shorewall6_del_port(current_user.username, str(port), proto, name, fwtype)
+        shorewall6_del_port(current_user.username, str(port), proto, name, fwtype, source_dip)
     return {'result': 'done', 'reason': 'changes applied', 'route': 'shorewallclose'}
 
 # Set MPTCP config
@@ -1353,19 +1437,26 @@ def lan(*, lanconfig: Lanips, current_user: User = Depends(get_current_user)):
 class VPNips(BaseModel):
     remoteip: str
     localip: str
-    ula: str
+    remoteip6: str = ""
+    localip6: str = ""
+    ula: str = ""
 
 # Set user vpn IPs
 @app.post('/vpnips')
 def vpnips(*, vpnconfig: VPNips, current_user: User = Depends(get_current_user)):
+    if current_user.permissions == "ro":
+        return {'result': 'permission', 'reason': 'Read only user', 'route': 'vpnips'}
     remoteip = vpnconfig.remoteip
     localip = vpnconfig.localip
+    remoteip6 = vpnconfig.remoteip6
+    localip6 = vpnconfig.localip6
     ula = vpnconfig.ula
-    if not remoteip or not localip or not ula:
+    if not remoteip or not localip:
         return {'result': 'error', 'reason': 'Invalid parameters', 'route': 'vpnips'}
     modif_config_user(current_user, {'vpnremoteip': remoteip})
     modif_config_user(current_user, {'vpnlocalip': localip})
-    modif_config_user(current_user, {'ula': ula})
+    if ula:
+        modif_config_user(current_user, {'ula': ula})
     userid = current_user.userid
     if userid is None:
         userid = 0
@@ -1376,9 +1467,16 @@ def vpnips(*, vpnconfig: VPNips, current_user: User = Depends(get_current_user))
     with open('/etc/openmptcprouter-vps-admin/omr-6in4/user' + str(userid), 'w+') as n:
         n.write('LOCALIP=' + localip + "\n")
         n.write('REMOTEIP=' + remoteip + "\n")
-        n.write('LOCALIP6=fe80::a0' + hex(userid)[2:] + ':1/126' + "\n")
-        n.write('REMOTEIP6=fe80::a0' + hex(userid)[2:] + ':2/126' + "\n")
-        n.write('ULA=' + ula + "\n")
+        if localip6:
+            n.write('LOCALIP6=' + localip6 + "\n")
+        else:
+            n.write('LOCALIP6=fe80::a0' + hex(userid)[2:] + ':1/126' + "\n")
+        if remoteip6:
+            n.write('REMOTEIP6=' + remoteip6 + "\n")
+        else:
+            n.write('REMOTEIP6=fe80::a0' + hex(userid)[2:] + ':2/126' + "\n")
+        if ula:
+            n.write('ULA=' + ula + "\n")
     final_md5 = hashlib.md5(file_as_bytes(open('/etc/openmptcprouter-vps-admin/omr-6in4/user' + str(userid), 'rb'))).hexdigest()
     if not initial_md5 == final_md5:
         os.system("systemctl -q restart omr6in4@user" + str(userid))
